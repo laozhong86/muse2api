@@ -134,6 +134,11 @@ class ConcurrencyLock:
         self.release()
 
 
+class MuseWorkspaceDisabled(MuseGenerationError):
+    def __init__(self):
+        super().__init__("Muse 工作区已停用（DISABLED），当前无法生成")
+
+
 class AccountPoolManager:
     """账号并发冲突管理器：确保同一账号不会同时被两个并发任务操作，多账号则并行执行。"""
     _REFERENCE_COOLDOWN = 120.0
@@ -148,7 +153,8 @@ class AccountPoolManager:
     def acquire(self, account_id: str | None = None, preferred_id: str | None = None,
                 rotate: bool = True, force_rotate: bool = False,
                 timeout: float | None = 60.0, record_use: bool = True,
-                reference_upload: bool = False, exclude_account_id: str | None = None) -> dict:
+                reference_upload: bool = False, exclude_account_id: str | None = None,
+                require_workspace: bool = False) -> dict:
         deadline = None if timeout is None else time.monotonic() + timeout
         with self.cond:
             while True:
@@ -162,6 +168,8 @@ class AccountPoolManager:
                     acc = self.store.get_account(account_id)
                     if not acc or not acc.get("enabled", True):
                         raise MuseAuthError(f"指定账号 {account_id} 不存在或已禁用")
+                    if require_workspace and acc.get("workspace_vm_state") == "DISABLED":
+                        raise MuseWorkspaceDisabled()
                     if reference_upload and self.reference_retry_at.get(account_id, 0) > now:
                         raise MuseGenerationError("指定账号的参考素材上传正在冷却，请稍后重试")
                     if account_id not in self.busy_accounts:
@@ -170,10 +178,16 @@ class AccountPoolManager:
                         self.busy_accounts.add(account_id)
                         return acc
                 else:
-                    blocked = self.busy_accounts.copy()
+                    disabled_workspaces = {
+                        a["id"] for a in live if require_workspace and a.get("workspace_vm_state") == "DISABLED"
+                    }
+                    if live and len(disabled_workspaces) == len(live):
+                        raise MuseWorkspaceDisabled()
+                    blocked = self.busy_accounts | disabled_workspaces
                     pref = preferred_id if preferred_id not in blocked else None
                     if reference_upload:
                         skipped = {aid for aid, retry_at in self.reference_retry_at.items() if retry_at > now}
+                        skipped.update(disabled_workspaces)
                         if exclude_account_id:
                             skipped.add(exclude_account_id)
                         eligible = [a for a in live if a["id"] not in skipped]
@@ -420,6 +434,7 @@ def _renew_and_persist(acc_id: str, wake_vm: bool = True, force: bool = False) -
             store.update_account(acc_id, cookies=res["cookies"],
                                  cookies_exp=res.get("cookies_exp"),
                                  ok=True if res.get("ok") else acc.get("ok"),
+                                 workspace_vm_state=res.get("vm_state"),
                                  synced_at=int(now))
             store.touch_keepalive(acc_id, True, f"会话正常 (VM: {res.get('vm_state') or 'RUNNING'})")
     except MuseAuthError as exc:
@@ -1229,7 +1244,8 @@ def _run_generation_locked(prompt: str, kind: str, timeout: int,
         remaining = max(0.001, queue_timeout - queued) if queue_timeout else None
         t0 = time.monotonic()
         try:
-            return ACCOUNT_POOL.acquire(timeout=remaining, reference_upload=reference_upload, **kwargs)
+            return ACCOUNT_POOL.acquire(timeout=remaining, reference_upload=reference_upload,
+                                        require_workspace=True, **kwargs)
         finally:
             waited = time.monotonic() - t0
             queued += waited
@@ -1266,9 +1282,14 @@ def _run_generation_locked(prompt: str, kind: str, timeout: int,
             _generation_callback(on_account, cur_acc["id"], attempt + 1)
             try:
                 _bind_account_proxy(cur_acc)
-                refreshed = _renew_and_persist(cur_acc["id"], wake_vm=True, force=(attempt > 0))
+                refreshed = _renew_and_persist(
+                    cur_acc["id"], wake_vm=True,
+                    force=attempt > 0 or not cur_acc.get("workspace_vm_state"),
+                )
                 if refreshed:
                     cur_acc = refreshed
+                if cur_acc.get("workspace_vm_state") == "DISABLED":
+                    raise MuseWorkspaceDisabled()
                 engine.start()
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
@@ -1284,6 +1305,9 @@ def _run_generation_locked(prompt: str, kind: str, timeout: int,
             except MuseProxyError as exc:
                 last_exc = exc
                 store.touch_keepalive(cur_acc["id"], None, f"代理异常: {str(exc)[:160]}")
+                engine.close_current_page()
+            except MuseWorkspaceDisabled as exc:
+                last_exc = exc
                 engine.close_current_page()
             except MuseReferenceComposerUnavailable as exc:
                 last_exc = exc
@@ -2077,7 +2101,7 @@ def patch_account(aid: str, req: AccountPatch, _=Depends(auth)):
                 raise HTTPException(409, "账号正在执行任务或检测，请稍后再修改代理")
             proxy = req.proxy.configuration(existing.get("proxy")) if req.proxy else {}
             if proxy != (existing.get("proxy") or {}):
-                changes.update(proxy=proxy, synced_at=0, last_keepalive=0,
+                changes.update(proxy=proxy, synced_at=0, last_keepalive=0, workspace_vm_state="",
                                checked_at=0, proxy_status={}, ok=None,
                                note="代理已修改，请重新测试")
                 receipt = _PROXY_TEST_RECEIPTS.get(aid)
@@ -2217,6 +2241,7 @@ def update_cookies(aid: str, payload: dict = Body(...), _=Depends(auth)):
     # 否则会沿用旧会话的锚点，把剩余天数算少。
     acc = store.update_account(aid, cookies=cookies, ok=None,
                                note="已更新 cookie",
+                               workspace_vm_state="", synced_at=0, last_keepalive=0,
                                expiry_anchor=int(time.time()),
                                cookies_exp=exp or None)
     if not acc:
@@ -2518,6 +2543,7 @@ def _probe_account_sync(aid: str, check_quota: bool = False) -> dict:
                 cookies=res["cookies"],
                 cookies_exp=res["cookies_exp"],
                 ok=True if res.get("ok") else False,
+                workspace_vm_state=res.get("vm_state"),
                 synced_at=int(time.time()),
             )
             vm_state = res.get("vm_state") or "RUNNING"
@@ -2582,6 +2608,7 @@ async def run_keepalive_all(force: bool = False) -> dict:
                 needs_run = (
                     force
                     or not last_ka
+                    or (a.get("workspace_vm_state") == "DISABLED" and now - last_ka >= 900)
                     or ((now - last_ka) > 6 * 3600 and
                         (not exp_at or exp_at - now < 36 * 3600 or
                          a.get("ok") is not True))

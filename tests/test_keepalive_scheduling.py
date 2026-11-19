@@ -42,6 +42,15 @@ def test_keepalive_only_runs_when_due():
                  "expires_at": now + 72 * 3600, "last_keepalive": now - 900, "ok": True},
                 {"id": "due", "label": "due", "enabled": True,
                  "expires_at": now + 24 * 3600, "last_keepalive": now - 7 * 3600, "ok": True},
+                {"id": "workspace-disabled", "label": "workspace-disabled", "enabled": True,
+                 "expires_at": now + 72 * 3600, "last_keepalive": now - 900, "ok": True,
+                 "workspace_vm_state": "DISABLED"},
+                {"id": "workspace-fresh", "label": "workspace-fresh", "enabled": True,
+                 "expires_at": now + 72 * 3600, "last_keepalive": now - 899, "ok": True,
+                 "workspace_vm_state": "DISABLED"},
+                {"id": "paused", "label": "paused", "enabled": False,
+                 "expires_at": now + 72 * 3600, "last_keepalive": now - 900, "ok": True,
+                 "workspace_vm_state": "DISABLED"},
             ]
     app.store = FakeStore()
     app.CFG = SimpleNamespace(keepalive_disabled_accounts=False)
@@ -54,9 +63,9 @@ def test_keepalive_only_runs_when_due():
              patch.object(app.asyncio, "sleep", return_value=None), \
              patch.object(app.time, "time", return_value=now):
             result = asyncio.run(app.run_keepalive_all())
-        assert called == ["due"]
-        assert result["refreshed_count"] == 1
-        assert result["skipped_count"] == 1
+        assert called == ["due", "workspace-disabled"]
+        assert result["refreshed_count"] == 2
+        assert result["skipped_count"] == 2
     finally:
         app.store, app.CFG = original_store, original_cfg
 

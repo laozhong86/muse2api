@@ -119,6 +119,50 @@ class GenerationQueueTests(unittest.TestCase):
         self.assertEqual(generate.call_args.kwargs["reference_images"], ["one", "two"])
         self.assertFalse(app.ACCOUNT_POOL.busy_accounts)
 
+    def test_generation_skips_disabled_workspace_without_marking_login_invalid(self):
+        first, second, third = self.accounts
+        for account in (first, third):
+            app.store.update_account(account["id"], ok=True, workspace_vm_state="DISABLED")
+        with patch.object(app.engine, "generate", return_value={"filename": "fixture.mp4"}) as generate:
+            _, used = app._run_generation("fixture", "video", 30, reference_image="fixture")
+        self.assertEqual(used, second["id"])
+        generate.assert_called_once()
+        self.assertTrue(first["ok"])
+        self.assertTrue(first["enabled"])
+
+    def test_workspace_disabled_during_renewal_rotates_before_browser_start(self):
+        first, second, third = self.accounts
+        app.store.update_account(third["id"], enabled=False)
+
+        def renew(aid, **kwargs):
+            state = "DISABLED" if aid == first["id"] else "UNKNOWN"
+            return app.store.update_account(aid, ok=True, workspace_vm_state=state)
+
+        with patch.object(app, "_renew_and_persist", side_effect=renew), \
+             patch.object(app.engine, "generate", return_value={"filename": "fixture.mp4"}) as generate:
+            _, used = app._run_generation("fixture", "video", 30)
+        self.assertEqual(used, second["id"])
+        generate.assert_called_once()
+        app.engine.start.assert_called_once()
+        app.engine.reset_thread.assert_not_called()
+        self.assertTrue(first["ok"])
+
+    def test_workspace_recheck_only_returns_accounts_with_available_workspace(self):
+        for account in self.accounts:
+            app.store.update_account(account["id"], ok=True, workspace_vm_state="DISABLED")
+        with patch.object(app.engine, "generate", return_value={"filename": "fixture.mp4"}) as generate:
+            with self.assertRaisesRegex(app.MuseGenerationError, "工作区"):
+                app._run_generation("fixture", "video", 30)
+            generate.assert_not_called()
+            reactivated = self.accounts[1]
+            upstream = {"ok": True, "vm_state": "UNKNOWN", "cookies": reactivated["cookies"],
+                        "cookies_exp": {}, "vm_id": None}
+            with patch.object(app.engine, "renew_session_http", return_value=upstream):
+                self.assertTrue(app._probe_account_sync(reactivated["id"])["ok"])
+            _, used = app._run_generation("fixture", "video", 30)
+            self.assertEqual(used, reactivated["id"])
+            generate.assert_called_once()
+
     def test_queue_failure_never_generates(self):
         with patch.object(app.GEN_LOCK,'acquire',return_value=False),patch.object(app.engine,'generate') as generate:
             with self.assertRaisesRegex(app.MuseGenerationError,'排队时限'):app._run_generation('x','video',1)
