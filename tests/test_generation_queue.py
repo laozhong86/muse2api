@@ -71,6 +71,54 @@ class GenerationQueueTests(unittest.TestCase):
                 app._run_generation('x','video',600)
         self.assertEqual(calls,[1]);self.assertFalse(app.GEN_LOCK.locked());self.assertFalse(app.ACCOUNT_POOL.busy_accounts)
 
+    def test_composer_failure_cools_only_reference_jobs_and_probes_once(self):
+        first, second, third = self.accounts
+        app.store.update_account(third["id"], enabled=False)
+        clock = [10.0]
+        attempts = []
+
+        def generate(*args, account_id, reference_image, **kwargs):
+            attempts.append((account_id, reference_image))
+            if account_id == first["id"] and reference_image:
+                raise app.MuseReferenceComposerUnavailable("composer_missing")
+            return {"filename": "result.mp4"}
+
+        with patch.object(app, "time", SimpleNamespace(monotonic=lambda: clock[0], time=time.time)), \
+             patch.object(app.engine, "generate", side_effect=generate):
+            original_ok = app.store.get_account(first["id"]).get("ok")
+            for _ in range(2):
+                app._run_generation("fixture", "video", 30, reference_image="fixture")
+            self.assertEqual(attempts, [(first["id"], "fixture"), (second["id"], "fixture"),
+                                        (second["id"], "fixture")])
+            self.assertEqual(app.store.get_account(first["id"]).get("ok"), original_ok)
+            self.assertTrue(app.store.get_account(first["id"])["enabled"])
+            app._run_generation("fixture", "image", 30)
+            self.assertEqual(attempts[-1], (first["id"], None))
+
+            clock[0] += 120
+            pool = app.ACCOUNT_POOL
+            probe = pool.acquire(reference_upload=True)
+            alternate = pool.acquire(reference_upload=True)
+            self.assertEqual((probe["id"], alternate["id"]), (first["id"], second["id"]))
+            pool.release(probe["id"])
+            pool.release(alternate["id"])
+            app._run_generation("fixture", "video", 30, reference_image="fixture")
+            self.assertEqual(attempts[-1], (second["id"], "fixture"))
+            clock[0] += 120
+            with patch.object(app.engine, "generate", return_value={"filename": "result.mp4"}):
+                _, recovered = app._run_generation("fixture", "video", 30, reference_image="fixture")
+                _, preferred = app._run_generation("fixture", "video", 30, reference_image="fixture")
+            self.assertEqual((recovered, preferred), (first["id"], first["id"]))
+
+    def test_reference_prompt_that_may_have_been_sent_never_rotates(self):
+        with patch.object(app.engine, "generate", side_effect=
+                          app.MuseReferencePromptPossiblySent("unconfirmed result")) as generate:
+            with self.assertRaisesRegex(app.MuseGenerationError, "unconfirmed result"):
+                app._run_generation("fixture", "video", 30, reference_images=["one", "two"])
+        generate.assert_called_once()
+        self.assertEqual(generate.call_args.kwargs["reference_images"], ["one", "two"])
+        self.assertFalse(app.ACCOUNT_POOL.busy_accounts)
+
     def test_queue_failure_never_generates(self):
         with patch.object(app.GEN_LOCK,'acquire',return_value=False),patch.object(app.engine,'generate') as generate:
             with self.assertRaisesRegex(app.MuseGenerationError,'排队时限'):app._run_generation('x','video',1)

@@ -14,6 +14,7 @@ import sys
 import tempfile
 import time
 from types import SimpleNamespace
+from urllib.parse import quote
 import requests
 
 parser = argparse.ArgumentParser()
@@ -128,7 +129,26 @@ with tempfile.TemporaryDirectory(prefix="muse-upload-check-", dir=Path.home()) a
             assert page.js("document.querySelector('#avatar').files.length") == 0
             print("PASS: the chat uploader wins over the sibling avatar form", flush=True)
 
-            engine._UPLOAD_CONTROL_WAIT = 0.3
+            class RecoveryPage:
+                def __init__(self, html):
+                    self.url = "data:text/html," + quote(html)
+                    self.navigations = 0
+                    self.uploads = []
+
+                def send(self, method, params, **kwargs):
+                    if method == "Page.navigate":
+                        assert params["url"] == "https://muse.ai/thread/new"
+                        self.navigations += 1
+                        params = {"url": self.url}
+                    if method == "DOM.setFileInputFiles":
+                        self.uploads.extend(Path(path).read_bytes() for path in params["files"])
+                    return page.send(method, params, **kwargs)
+
+                def js(self, script, **kwargs):
+                    return page.js(script, **kwargs)
+
+            engine._UPLOAD_CONTROL_WAIT = 0.8
+            engine._UPLOAD_CONTROL_STABLE = 0.25
             engine.ensure_page = lambda *_args, **_kwargs: page
             engine.reset_thread = lambda **_kwargs: None
             engine._scroll_bottom = lambda: None
@@ -148,14 +168,43 @@ with tempfile.TemporaryDirectory(prefix="muse-upload-check-", dir=Path.home()) a
                     with_avatar()
                 else:
                     set_composer(outside=outside)
+                recovery = RecoveryPage(page.js("document.body.innerHTML"))
+                engine.page = recovery
                 try:
-                    engine.generate({}, "upload test", reference_images=[png])
-                except module.MuseGenerationError as exc:
+                    engine.generate({}, "upload test", timeout=10, reference_images=[png])
+                except module.MuseReferenceComposerUnavailable as exc:
                     assert reason in str(exc), (case, str(exc))
                 else:
                     raise AssertionError(f"{case}: should not upload")
+                assert recovery.navigations == 1 and not recovery.uploads
                 assert page.js("Array.from(document.querySelectorAll('input[type=file]')).every(i=>!i.files.length)")
                 print(f"PASS: {case} uploader stops safely with its own reason", flush=True)
+
+            set_composer('<input id="short-lived" type="file">', avatar)
+            page.js("setTimeout(() => document.querySelector('section').remove(), 350); true")
+            assert page.js("!!document.querySelector('#short-lived')")
+            recovered_html = """<main><section><div><textarea></textarea>
+                <input type="file" onchange="this.insertAdjacentHTML('beforebegin',
+                '&lt;button aria-label=&quot;Remove attachment&quot;&gt;&lt;/button&gt;')">
+                </div></section>""" + avatar + "</main>"
+            recovered = RecoveryPage(recovered_html)
+            engine.page = recovered
+            engine._UPLOAD_CONTROL_WAIT = 2.6
+            engine._UPLOAD_CONTROL_STABLE = 1.5
+            received = []
+            def submit(prompt, *_args):
+                received.append(prompt)
+                assert page.js("document.querySelector('#avatar').files.length") == 0
+                return {"filename": "generated.mp4"}
+            engine._generate_attached = submit
+            second = bytes.fromhex("89504e470d0a1a0a") + b"second"
+            second_png = "data:image/png;base64," + base64.b64encode(second).decode()
+            output = engine.generate({}, "one submission", timeout=15, reference_images=[second_png, png])
+            assert recovered.navigations == 1 and received == ["one submission"]
+            assert recovered.uploads == [second, bytes.fromhex("89504e470d0a1a0a")]
+            assert output["filename"] == "generated.mp4"
+            print("PASS: initially hydrated composer disappears, fresh composer uploads in order and submits once",
+                  flush=True)
     finally:
         if page:
             try:

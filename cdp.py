@@ -25,20 +25,30 @@ class CDP:
         with self._lock:
             self._id += 1
             mid = self._id
-            self.ws.send(json.dumps({"id": mid, "method": method, "params": params or {}}))
-            deadline = time.time() + (timeout or self.timeout)
-            while time.time() < deadline:
-                try:
-                    msg = json.loads(self.ws.recv())
-                except websocket.WebSocketTimeoutException:
-                    continue
-                except Exception:  # noqa: BLE001
-                    continue
-                if msg.get("id") == mid:
-                    if "error" in msg:
-                        raise CDPError(f"{method}: {msg['error']}")
-                    return msg
-            raise TimeoutError(f"CDP {method} 超时")
+            socket_timeout = self.ws.gettimeout()
+            budget = self.timeout if timeout is None else timeout
+            deadline = time.monotonic() + budget
+            try:
+                if budget <= 0:
+                    raise TimeoutError(f"CDP {method} 超时")
+                if timeout is not None:
+                    self.ws.settimeout(budget)
+                self.ws.send(json.dumps({"id": mid, "method": method, "params": params or {}}))
+                while (remaining := deadline - time.monotonic()) > 0:
+                    if timeout is not None:
+                        self.ws.settimeout(remaining)
+                    try:
+                        msg = json.loads(self.ws.recv())
+                    except websocket.WebSocketTimeoutException:
+                        continue
+                    if msg.get("id") == mid:
+                        if "error" in msg:
+                            raise CDPError(f"{method}: {msg['error']}")
+                        return msg
+                raise TimeoutError(f"CDP {method} 超时")
+            finally:
+                if timeout is not None:
+                    self.ws.settimeout(socket_timeout)
 
     def js(self, expr: str, await_promise: bool = False, timeout: float | None = None):
         r = self.send("Runtime.evaluate",

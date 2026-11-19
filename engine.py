@@ -33,7 +33,7 @@ import time
 import uuid
 import unicodedata
 
-from cdp import CDP, http_json
+from cdp import CDP, CDPError, http_json
 from proxy import HTTPProxyRelay, request_proxy_context
 
 log = logging.getLogger("muse2api")
@@ -216,6 +216,26 @@ class MuseAuthError(RuntimeError):
 
 class MuseGenerationError(RuntimeError):
     pass
+
+
+class MuseReferenceComposerUnavailable(MuseGenerationError):
+    """The current conversation cannot safely accept references before sending."""
+
+    def __init__(self, state: str):
+        reasons = {
+            "composer_missing": "当前对话输入区未就绪",
+            "missing": "等待上传控件超时",
+            "disabled": "上传控件仍不可用",
+            "ambiguous": "无法确认上传控件属于当前输入区（多个候选）",
+            "unrelated": "无法确认上传控件属于当前输入区",
+            "unstable": "当前对话上传控件不稳定",
+        }
+        self.state = state
+        super().__init__(f"找不到上传控件，{reasons.get(state, '无法识别上传控件状态')}，已停止生成")
+
+
+class MuseReferencePromptPossiblySent(MuseGenerationError):
+    """Sending may have started, so retrying on another account could duplicate it."""
 
 
 class MuseProxyError(MuseGenerationError):
@@ -1786,12 +1806,11 @@ class MuseEngine:
     # 输入框所在容器是 textarea 往上第二层，附件的「Remove attachment」按钮在那里。
     # 旧结构（overlay / form）优先，新结构从 textarea 逐级向上找最近的一层。
     _COMPOSER_ROOTS_JS = """
-        function __composerRoots(){
-            var ov = document.querySelector('[data-testid="hatch-composer-placeholder-overlay"]');
-            var legacy = ov ? (ov.closest('form') || ov.parentElement.parentElement.parentElement) : null;
-            if (legacy) return [legacy];
-            var ta = document.querySelector('textarea');
+        function __composerRoots(ta = document.querySelector('textarea')){
             if (!ta) return [];
+            var ov = document.querySelector('[data-testid="hatch-composer-placeholder-overlay"]');
+            var legacy = ov && (ov.closest('form') || ov.parentElement?.parentElement?.parentElement);
+            if (legacy && legacy.contains(ta)) return [legacy];
             var form = ta.closest('form');
             if (form) return [form];
             var out = [], el = ta.parentElement;
@@ -1800,12 +1819,25 @@ class MuseEngine:
         }
     """
 
-    _FILE_INPUT_JS = "(function(allowLinkedOutside){" + _COMPOSER_ROOTS_JS + """
+    _REFERENCE_COMPOSER_JS = """
         var excluded = 'aside,nav,header,footer,dialog,[role="dialog"],[role="navigation"],' +
                        '.chat-user-bubble,[class*="group/msg"],[class*="hatch-chat-groupable-bubble"]';
+        function __referenceComposer(){
+            var ta = document.querySelector('textarea');
+            var shell = document.querySelector('[data-hatch-shell-hydration-state]');
+            if (document.readyState !== 'complete' ||
+                (shell && shell.getAttribute('data-hatch-shell-hydration-state') !== 'hydrated') ||
+                !ta || ta.disabled || ta.readOnly || !ta.getClientRects().length ||
+                getComputedStyle(ta).visibility !== 'visible' ||
+                ta.closest(excluded + ',[hidden],[inert],[aria-hidden="true"]')) return null;
+            return ta;
+        }
+    """
+
+    _FILE_INPUT_JS = "(function(allowLinkedOutside){" + _COMPOSER_ROOTS_JS + _REFERENCE_COMPOSER_JS + r"""
         // Outer layout ancestors can contain independent upload forms.
-        var scope = __composerRoots()[0];
-        if (!scope || scope.matches('main,[role="main"]') || scope.closest(excluded)) {
+        var scope = __composerRoots(__referenceComposer())[0];
+        if (!scope || scope.matches('main,[role="main"]')) {
             return 'composer_missing';
         }
         var composerForm = scope.closest('form');
@@ -1843,48 +1875,95 @@ class MuseEngine:
     })()"""
 
     _UPLOAD_CONTROL_WAIT = 5.0
+    # In failing sessions the initially hydrated composer vanished within 1.1s.
+    _UPLOAD_CONTROL_STABLE = 1.5
+    _UPLOAD_COMPOSER_STATE_JS = "(function(previousDocument){" + _REFERENCE_COMPOSER_JS + """
+        var composer = performance.timeOrigin === previousDocument ? null : __referenceComposer();
+        if (!composer) return 'composer_missing';
+        var findInput = """ + _FILE_INPUT_JS + """;
+        var input = findInput(true);
+        if (typeof input === 'string') return input;
+        // Identity is local to this document and does not keep detached nodes alive.
+        var key = Symbol.for('muse2api.referenceComposerNodes');
+        var ids = globalThis[key] ??= {nodes: new WeakMap(), sequence: 0};
+        return [performance.timeOrigin, ...[composer, input].map(node => {
+            if (!ids.nodes.has(node)) ids.nodes.set(node, ++ids.sequence);
+            return ids.nodes.get(node);
+        })];
+    })"""
 
-    def _set_input_files(self, paths: list[str], *, wait_timeout: float = _UPLOAD_CONTROL_WAIT) -> float:
+    def _wait_for_reference_composer(self, deadline: float, previous_document: float | None):
+        """Observe the same composer and scoped input through hydration."""
+        expression = self._UPLOAD_COMPOSER_STATE_JS + f"({json.dumps(previous_document)})"
+        state = "composer_missing"
+        identity = None
+        stable_since = None
+        while (remaining := deadline - time.monotonic()) > 0:
+            try:
+                observation = self.page.js(expression, timeout=remaining)
+            except CDPError as exc:
+                # Runtime.evaluate can race the new document after Page.navigate.
+                if previous_document is None or "context" not in str(exc).lower():
+                    raise
+                observation = "composer_missing"
+            if isinstance(observation, list):
+                now = time.monotonic()
+                if observation != identity:
+                    identity = observation
+                    stable_since = now
+                if now - stable_since >= self._UPLOAD_CONTROL_STABLE:
+                    return
+                state = "unstable"
+            elif isinstance(observation, str) or previous_document is not None:
+                state = observation if isinstance(observation, str) else "composer_missing"
+                identity = None
+            else:
+                raise MuseGenerationError("检查参考素材上传控件时页面响应异常，已停止生成")
+            time.sleep(min(0.075, max(0, deadline - time.monotonic())))
+        log.info("Reference upload control unavailable: state=%s", state)
+        raise MuseReferenceComposerUnavailable(state)
+
+    def _set_input_files(self, paths: list[str], *, wait_timeout: float | None = None,
+                         deadline: float = float("inf")) -> float:
         """Use the current composer's file input and return the time spent waiting for it."""
         started = time.monotonic()
-        deadline = started + wait_timeout
+        wait_until = started + (self._UPLOAD_CONTROL_WAIT if wait_timeout is None else wait_timeout)
         waited = False
         while True:
+            now = time.monotonic()
+            if now >= deadline:
+                raise MuseGenerationError("任务准备超时，已停止发送")
             result = self.page.send("Runtime.evaluate", {
-                "expression": self._FILE_INPUT_JS + "(false)", "returnByValue": False})
+                "expression": self._FILE_INPUT_JS + "(false)", "returnByValue": False},
+                timeout=min(deadline - now, max(0.1, wait_until - now)))
             match = result["result"]["result"]
             outside = match.get("value") == "linked_outside"
             if outside:
                 result = self.page.send("Runtime.evaluate", {
-                    "expression": self._FILE_INPUT_JS + "(true)", "returnByValue": False})
+                    "expression": self._FILE_INPUT_JS + "(true)", "returnByValue": False},
+                    timeout=min(deadline - time.monotonic(), self._UPLOAD_CONTROL_WAIT))
                 match = result["result"]["result"]
             object_id = match.get("objectId")
             elapsed = time.monotonic() - started
             if object_id:
                 self.page.send("DOM.setFileInputFiles",
-                               {"files": paths, "objectId": object_id}, timeout=60)
+                               {"files": paths, "objectId": object_id},
+                               timeout=min(60, deadline - time.monotonic()))
                 if waited or outside:
                     log.info("Reference upload control resolved: delayed=%s linked_outside=%s wait_ms=%d",
                              waited, outside, round(elapsed * 1000))
                 return elapsed if waited else 0.0
             state = match.get("value")
-            remaining = deadline - time.monotonic()
+            remaining = min(deadline, wait_until) - time.monotonic()
             if remaining <= 0:
-                reasons = {
-                    "composer_missing": "当前对话输入区未就绪",
-                    "missing": "等待上传控件超时",
-                    "disabled": "上传控件仍不可用",
-                    "ambiguous": "无法确认上传控件属于当前输入区（多个候选）",
-                    "unrelated": "无法确认上传控件属于当前输入区",
-                }
                 log.info("Reference upload control unavailable: state=%s wait_ms=%d",
                          state, round(elapsed * 1000))
-                reason = reasons.get(state, "无法识别上传控件状态")
-                raise MuseGenerationError(f"找不到上传控件，{reason}，已停止生成")
+                raise MuseReferenceComposerUnavailable(state)
             waited = True
             time.sleep(min(0.1, remaining))
 
-    def _attach_images(self, image_data: list[str], *, deadline: float | None = None) -> dict | None:
+    def _attach_images(self, image_data: list[str], *, deadline: float = float("inf"),
+                       previous_document: float | None = None) -> dict | None:
         """逐个附加参考素材（图片/视频/音频/文档），并确认全部进入输入框。
 
         返回 {"dir": 临时目录, "hashes": 素材 sha256 集合}；调用方在生成结束后
@@ -1913,12 +1992,18 @@ class MuseEngine:
         if not files:
             return None
 
-        self._clear_attachments()
+        # Clearing the previous draft can itself change the active composer.
+        # The newly navigated document already starts with an empty draft.
+        if previous_document is None:
+            self._clear_attachments()
+        started = time.monotonic()
+        self._wait_for_reference_composer(min(deadline, started + self._UPLOAD_CONTROL_WAIT),
+                                          previous_document)
         # Snap Chromium cannot read the host's /tmp; profile_dir is shared with it.
         os.makedirs(self.cfg.profile_dir, exist_ok=True)
         upload_dir = tempfile.mkdtemp(prefix="muse2api-refs-", dir=self.cfg.profile_dir)
         hashes = set()
-        wait_budget = self._UPLOAD_CONTROL_WAIT
+        wait_budget = max(0.0, self._UPLOAD_CONTROL_WAIT - (time.monotonic() - started))
         try:
             for index, data, mime in files:
                 path = os.path.join(
@@ -1926,15 +2011,12 @@ class MuseEngine:
                 with open(path, "wb") as f:
                     f.write(data)
                 hashes.add(hashlib.sha256(data).hexdigest())
-                wait_timeout = wait_budget
-                if deadline is not None:
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        raise MuseGenerationError("任务准备超时，已停止发送")
-                    wait_timeout = min(wait_timeout, remaining)
-                waited = self._set_input_files([path], wait_timeout=wait_timeout)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise MuseGenerationError("任务准备超时，已停止发送")
+                waited = self._set_input_files([path], wait_timeout=wait_budget, deadline=deadline)
                 wait_budget = max(0.0, wait_budget - waited)
-                time.sleep(0.35)
+                time.sleep(min(0.35, max(0, deadline - time.monotonic())))
         except MuseGenerationError:
             shutil.rmtree(upload_dir, ignore_errors=True)
             raise
@@ -1944,17 +2026,26 @@ class MuseEngine:
 
         try:
             # A remove button proves attachment presence, not upstream processing success.
-            deadline = time.monotonic() + 30.0
+            confirm_until = min(deadline, time.monotonic() + 30.0)
             attached_count = 0
-            while time.monotonic() < deadline:
-                attached_count = self.page.js(self._ATTACHED_COUNT_JS)
+            count_script = ("(function(){" + self._REFERENCE_COMPOSER_JS +
+                            "return __referenceComposer() ? " + self._ATTACHED_COUNT_JS + " : -1;})()")
+            while (remaining := confirm_until - time.monotonic()) > 0:
+                attached_count = self.page.js(count_script, timeout=remaining)
+                if attached_count == -1:
+                    raise MuseReferenceComposerUnavailable("composer_missing")
                 if int(attached_count or 0) >= len(files):
                     break
-                time.sleep(0.3)
+                time.sleep(min(0.3, max(0, confirm_until - time.monotonic())))
             else:
                 raise MuseGenerationError(
                     f"参考素材上传未确认（{int(attached_count or 0)}/{len(files)}），已停止生成")
-            time.sleep(0.5)
+            time.sleep(min(0.5, max(0, deadline - time.monotonic())))
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise MuseGenerationError("任务准备超时，已停止发送")
+            if int(self.page.js(count_script, timeout=min(remaining, self._UPLOAD_CONTROL_WAIT)) or 0) < len(files):
+                raise MuseReferenceComposerUnavailable("unstable")
             return {"dir": upload_dir, "hashes": hashes}
         except Exception:
             shutil.rmtree(upload_dir, ignore_errors=True)
@@ -1974,12 +2065,39 @@ class MuseEngine:
         self.reset_thread(for_chat=False)
         self._scroll_bottom()
         refs = list(reference_images or ([] if not reference_image else [reference_image]))
-        upload = self._attach_images(refs, deadline=deadline) if refs else None
-        if not refs:
+        upload = None
+        if refs:
+            try:
+                upload = self._attach_images(refs, deadline=deadline)
+            except MuseReferenceComposerUnavailable:
+                remaining = deadline - time.monotonic()
+                if remaining <= self._UPLOAD_CONTROL_STABLE + 0.15:
+                    raise
+                navigation_deadline = min(deadline, time.monotonic() + self._UPLOAD_CONTROL_WAIT)
+                log.info("Reopening Muse conversation before sending references")
+                document = self.page.js("performance.timeOrigin",
+                                        timeout=navigation_deadline - time.monotonic())
+                if not isinstance(document, (float, int)):
+                    raise
+                remaining = navigation_deadline - time.monotonic()
+                if remaining <= 0:
+                    raise
+                navigation = self.page.send("Page.navigate", {"url": "https://muse.ai/thread/new"},
+                                            timeout=remaining).get("result", {})
+                if navigation.get("errorText"):
+                    raise
+                upload = self._attach_images(refs, deadline=deadline, previous_document=document)
+        else:
             self._clear_attachments()
         try:
             return self._generate_attached(prompt, expect, deadline, on_progress,
                                            stop_event, (upload or {}).get("hashes") or set())
+        except MuseModelRefusalError:
+            raise
+        except Exception as exc:
+            if refs:
+                raise MuseReferencePromptPossiblySent(str(exc)) from exc
+            raise
         finally:
             if upload:
                 shutil.rmtree(upload["dir"], ignore_errors=True)
