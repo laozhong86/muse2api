@@ -1,4 +1,4 @@
-name: Muse2API upload regression at 51f5ed1
+name: Muse2API upload regression at dcdc296
 
 on:
   push:
@@ -12,7 +12,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     env:
-      TARGET_SHA: 51f5ed1ae20b7e5b9e1020747db68cc705b2dc47
+      TARGET_SHA: dcdc296a87cbdbb7598017009f76d3b663bc3bdc
     steps:
       - name: Check out the exact PR commit
         run: |
@@ -30,6 +30,7 @@ jobs:
             --entrypoint sh muse2api-upload-ci -eu -c '
               cd /src
               python tests/test_reference_upload_browser.py --root /src
+              python tests/test_reference_media_hardening.py
               python tests/test_composer_send_browser.py --root /src
               python tests/test_video_late_attachment.py
               python tests/test_reference_media.py
