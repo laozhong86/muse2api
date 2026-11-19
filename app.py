@@ -52,7 +52,8 @@ from config import CFG
 from engine import (ESSENTIAL_COOKIES, MAX_REFERENCE_IMAGE_BYTES,
                     MAX_REFERENCE_IMAGES, MAX_REFERENCE_TOTAL_BYTES,
                     REFERENCE_MIME_EXT, MuseAuthError, MuseEngine, MuseGenerationError,
-                    MuseModelRefusalError, RefImageSafetyError, reference_kind)
+                    MuseModelRefusalError, MuseReferenceComposerUnavailable,
+                    MuseReferencePromptPossiblySent, RefImageSafetyError, reference_kind)
 from engine import MuseProxyError, MuseSessionUnavailable
 from store import Store, account_expiry, min_expiry
 from generation_timing import QueuePolicy, QueueSettings, TaskTiming
@@ -133,48 +134,106 @@ class ConcurrencyLock:
         self.release()
 
 
+class MuseWorkspaceDisabled(MuseGenerationError):
+    def __init__(self):
+        super().__init__("Muse 工作区已停用（DISABLED），当前无法生成")
+
+
 class AccountPoolManager:
     """账号并发冲突管理器：确保同一账号不会同时被两个并发任务操作，多账号则并行执行。"""
+    _REFERENCE_COOLDOWN = 120.0
+
     def __init__(self, store_instance):
         self.store = store_instance
         self.busy_accounts: set[str] = set()
         self.cond = threading.Condition()
+        self.reference_retry_at: dict[str, float] = {}
+        self.reference_success_at: dict[str, float] = {}
 
     def acquire(self, account_id: str | None = None, preferred_id: str | None = None,
                 rotate: bool = True, force_rotate: bool = False,
-                timeout: float | None = 60.0, record_use: bool = True) -> dict:
+                timeout: float | None = 60.0, record_use: bool = True,
+                reference_upload: bool = False, exclude_account_id: str | None = None,
+                require_workspace: bool = False) -> dict:
         deadline = None if timeout is None else time.monotonic() + timeout
         with self.cond:
             while True:
-                remaining = None if deadline is None else deadline - time.monotonic()
+                now = time.monotonic()
+                remaining = None if deadline is None else deadline - now
                 if remaining is not None and remaining <= 0:
                     raise MuseGenerationError("等待空闲账号超时，当前所有账号均处于繁忙中")
 
+                live = [a for a in self.store.accounts if a.get("enabled", True) and a.get("cookies")]
                 if account_id:
                     acc = self.store.get_account(account_id)
                     if not acc or not acc.get("enabled", True):
                         raise MuseAuthError(f"指定账号 {account_id} 不存在或已禁用")
+                    if require_workspace and acc.get("workspace_vm_state") == "DISABLED":
+                        raise MuseWorkspaceDisabled()
+                    if reference_upload and self.reference_retry_at.get(account_id, 0) > now:
+                        raise MuseGenerationError("指定账号的参考素材上传正在冷却，请稍后重试")
                     if account_id not in self.busy_accounts:
+                        if reference_upload and account_id in self.reference_retry_at:
+                            self.reference_retry_at[account_id] = now + self._REFERENCE_COOLDOWN
                         self.busy_accounts.add(account_id)
                         return acc
                 else:
-                    pref = preferred_id if preferred_id not in self.busy_accounts else None
+                    disabled_workspaces = {
+                        a["id"] for a in live if require_workspace and a.get("workspace_vm_state") == "DISABLED"
+                    }
+                    if live and len(disabled_workspaces) == len(live):
+                        raise MuseWorkspaceDisabled()
+                    blocked = self.busy_accounts | disabled_workspaces
+                    pref = preferred_id if preferred_id not in blocked else None
+                    if reference_upload:
+                        skipped = {aid for aid, retry_at in self.reference_retry_at.items() if retry_at > now}
+                        skipped.update(disabled_workspaces)
+                        if exclude_account_id:
+                            skipped.add(exclude_account_id)
+                        eligible = [a for a in live if a["id"] not in skipped]
+                        if live and not eligible:
+                            raise MuseGenerationError("暂无可用的参考素材上传账号，请稍后重试")
+                        blocked.update(skipped)
+                        healthy = [a["id"] for a in eligible
+                                   if a["id"] not in blocked and a.get("ok") is not False]
+                        probes = [aid for aid in healthy if aid in self.reference_retry_at]
+                        verified = [aid for aid in healthy if aid in self.reference_success_at]
+                        if probes:
+                            pref = min(probes, key=self.reference_retry_at.__getitem__)
+                        elif verified:
+                            pref = max(verified, key=self.reference_success_at.__getitem__)
+                        else:
+                            pref = None
                     acc = self.store.pick_account(
                         preferred_id=pref,
-                        rotate=rotate,
-                        force_rotate=force_rotate,
-                        exclude_ids=self.busy_accounts,
+                        rotate=rotate if not reference_upload else pref is None,
+                        force_rotate=force_rotate and not reference_upload,
+                        exclude_ids=blocked,
                         record_use=record_use,
                     )
                     if acc:
-                        self.busy_accounts.add(acc["id"])
+                        aid = acc["id"]
+                        if reference_upload and aid in self.reference_retry_at:
+                            # Reserve one probe now. Only a successful result clears the cooldown.
+                            self.reference_retry_at[aid] = now + self._REFERENCE_COOLDOWN
+                        self.busy_accounts.add(aid)
                         return acc
 
-                live = [a for a in self.store.accounts if a.get("enabled", True) and a.get("cookies")]
                 if not live:
                     raise MuseAuthError("没有可用账号，请先在管理页面导入 cookie")
 
                 self.cond.wait(timeout=0.5 if remaining is None else min(remaining, 0.5))
+
+    def mark_reference_upload(self, account_id: str, succeeded: bool):
+        """Track reference availability independently of cookies and keepalive."""
+        with self.cond:
+            now = time.monotonic()
+            if succeeded:
+                self.reference_retry_at.pop(account_id, None)
+                self.reference_success_at[account_id] = now
+            else:
+                self.reference_retry_at[account_id] = now + self._REFERENCE_COOLDOWN
+                self.reference_success_at.pop(account_id, None)
 
     def release(self, account_id: str | None):
         if not account_id:
@@ -375,6 +434,7 @@ def _renew_and_persist(acc_id: str, wake_vm: bool = True, force: bool = False) -
             store.update_account(acc_id, cookies=res["cookies"],
                                  cookies_exp=res.get("cookies_exp"),
                                  ok=True if res.get("ok") else acc.get("ok"),
+                                 workspace_vm_state=res.get("vm_state"),
                                  synced_at=int(now))
             store.touch_keepalive(acc_id, True, f"会话正常 (VM: {res.get('vm_state') or 'RUNNING'})")
     except MuseAuthError as exc:
@@ -1171,12 +1231,21 @@ def _run_generation_locked(prompt: str, kind: str, timeout: int,
     if queue_timeout is None:
         queue_timeout = QUEUE_POLICY.settings()["queue_timeout"]
 
+    refs = list(reference_images or [])
+    engine_kwargs = {}
+    if len(refs) == 1 and not reference_image:
+        reference_image = refs[0]
+    elif len(refs) > 1:
+        engine_kwargs["reference_images"] = refs
+    reference_upload = bool(reference_image or engine_kwargs)
+
     def lease(**kwargs):
         nonlocal queued, deadline
         remaining = max(0.001, queue_timeout - queued) if queue_timeout else None
         t0 = time.monotonic()
         try:
-            return ACCOUNT_POOL.acquire(timeout=remaining, **kwargs)
+            return ACCOUNT_POOL.acquire(timeout=remaining, reference_upload=reference_upload,
+                                        require_workspace=True, **kwargs)
         finally:
             waited = time.monotonic() - t0
             queued += waited
@@ -1204,7 +1273,7 @@ def _run_generation_locked(prompt: str, kind: str, timeout: int,
                     ACCOUNT_POOL.release(old_id)
                 cur_acc = None
                 try:
-                    alt = lease(rotate=True, force_rotate=True)
+                    alt = lease(rotate=True, force_rotate=True, exclude_account_id=old_id)
                 except (MuseAuthError, MuseGenerationError):
                     raise last_exc
                 cur_acc = alt
@@ -1213,26 +1282,22 @@ def _run_generation_locked(prompt: str, kind: str, timeout: int,
             _generation_callback(on_account, cur_acc["id"], attempt + 1)
             try:
                 _bind_account_proxy(cur_acc)
-                refreshed = _renew_and_persist(cur_acc["id"], wake_vm=True, force=(attempt > 0))
+                refreshed = _renew_and_persist(
+                    cur_acc["id"], wake_vm=True,
+                    force=attempt > 0 or not cur_acc.get("workspace_vm_state"),
+                )
                 if refreshed:
                     cur_acc = refreshed
+                if cur_acc.get("workspace_vm_state") == "DISABLED":
+                    raise MuseWorkspaceDisabled()
                 engine.start()
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise MuseGenerationError("生成准备超时（不含排队时间），尚未发送本次提示词")
-                refs = list(reference_images or [])
-                engine_kwargs = {}
-                if len(refs) == 1 and not reference_image:
-                    reference_image = refs[0]
-                elif len(refs) > 1:
-                    engine_kwargs["reference_images"] = refs
                 res = engine.generate(cur_acc["cookies"], prompt, expect=kind,
                                       timeout=remaining, expires=cur_acc.get("cookies_exp"),
                                       account_id=cur_acc["id"], on_progress=on_progress,
                                       reference_image=reference_image, **engine_kwargs)
-                store.mark(cur_acc["id"], True, "")
-                _sync_cookies(cur_acc["id"])
-                return res, cur_acc["id"]
             except MuseAuthError as exc:
                 last_exc = exc
                 store.mark(cur_acc["id"], False, str(exc))
@@ -1241,18 +1306,35 @@ def _run_generation_locked(prompt: str, kind: str, timeout: int,
                 last_exc = exc
                 store.touch_keepalive(cur_acc["id"], None, f"代理异常: {str(exc)[:160]}")
                 engine.close_current_page()
+            except MuseWorkspaceDisabled as exc:
+                last_exc = exc
+                engine.close_current_page()
+            except MuseReferenceComposerUnavailable as exc:
+                last_exc = exc
+                ACCOUNT_POOL.mark_reference_upload(cur_acc["id"], succeeded=False)
+                engine.close_current_page()
             except MuseGenerationError as exc:
                 last_exc = exc
                 store.mark(cur_acc["id"], True, f"任务异常: {str(exc)[:200]}")
-                try:
-                    engine.reset_thread()
-                except Exception:
-                    pass
+                if not isinstance(exc, MuseReferencePromptPossiblySent):
+                    try:
+                        engine.reset_thread()
+                    except Exception:
+                        pass
             except Exception as exc:
                 engine.close_current_page()
                 last_exc = MuseGenerationError(f"生成失败: {exc}")
+            else:
+                # A metadata write after a completed generation must not submit a second turn.
+                if reference_upload:
+                    ACCOUNT_POOL.mark_reference_upload(cur_acc["id"], succeeded=True)
+                store.mark(cur_acc["id"], True, "")
+                _sync_cookies(cur_acc["id"])
+                return res, cur_acc["id"]
             if on_error:
                 on_error(str(last_exc))
+            if isinstance(last_exc, MuseReferencePromptPossiblySent):
+                break
         raise last_exc
     finally:
         if cur_acc:
@@ -2019,7 +2101,7 @@ def patch_account(aid: str, req: AccountPatch, _=Depends(auth)):
                 raise HTTPException(409, "账号正在执行任务或检测，请稍后再修改代理")
             proxy = req.proxy.configuration(existing.get("proxy")) if req.proxy else {}
             if proxy != (existing.get("proxy") or {}):
-                changes.update(proxy=proxy, synced_at=0, last_keepalive=0,
+                changes.update(proxy=proxy, synced_at=0, last_keepalive=0, workspace_vm_state="",
                                checked_at=0, proxy_status={}, ok=None,
                                note="代理已修改，请重新测试")
                 receipt = _PROXY_TEST_RECEIPTS.get(aid)
@@ -2159,6 +2241,7 @@ def update_cookies(aid: str, payload: dict = Body(...), _=Depends(auth)):
     # 否则会沿用旧会话的锚点，把剩余天数算少。
     acc = store.update_account(aid, cookies=cookies, ok=None,
                                note="已更新 cookie",
+                               workspace_vm_state="", synced_at=0, last_keepalive=0,
                                expiry_anchor=int(time.time()),
                                cookies_exp=exp or None)
     if not acc:
@@ -2460,6 +2543,7 @@ def _probe_account_sync(aid: str, check_quota: bool = False) -> dict:
                 cookies=res["cookies"],
                 cookies_exp=res["cookies_exp"],
                 ok=True if res.get("ok") else False,
+                workspace_vm_state=res.get("vm_state"),
                 synced_at=int(time.time()),
             )
             vm_state = res.get("vm_state") or "RUNNING"
@@ -2524,6 +2608,7 @@ async def run_keepalive_all(force: bool = False) -> dict:
                 needs_run = (
                     force
                     or not last_ka
+                    or (a.get("workspace_vm_state") == "DISABLED" and now - last_ka >= 900)
                     or ((now - last_ka) > 6 * 3600 and
                         (not exp_at or exp_at - now < 36 * 3600 or
                          a.get("ok") is not True))

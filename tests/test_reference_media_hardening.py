@@ -66,8 +66,9 @@ with tempfile.TemporaryDirectory() as home:
     print("PASS: ten original uploads are skipped before delivering the actual result")
 
     engine._clear_attachments = lambda: None
-    engine._set_input_files = lambda paths, *, wait_timeout: 0.0
-    def disconnect(_):
+    engine._wait_for_reference_composer = lambda deadline, previous_document: None
+    engine._set_input_files = lambda paths, *, wait_timeout, deadline: 0.0
+    def disconnect(_, *, timeout):
         raise RuntimeError("synthetic CDP disconnect")
     engine.page = SimpleNamespace(js=disconnect)
     before = set(Path(home).iterdir())
@@ -79,7 +80,7 @@ with tempfile.TemporaryDirectory() as home:
         else:
             raise AssertionError("expected a CDP exception")
     assert set(Path(home).iterdir()) == before
-    engine.page = SimpleNamespace(js=lambda script: 1)
+    engine.page = SimpleNamespace(js=lambda script, *, timeout: 1)
     with patch("engine.time.sleep", lambda value: None):
         upload = engine._attach_images([data_url("image/png", b"fixture")])
     assert Path(upload["dir"]).parent == Path(home)
