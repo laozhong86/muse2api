@@ -1,0 +1,36 @@
+name: Muse2API upload regression at 51f5ed1
+
+on:
+  push:
+    branches: [codex/ci-muse-upload-control]
+
+permissions:
+  contents: read
+
+jobs:
+  chromium-regression:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      TARGET_SHA: 51f5ed1ae20b7e5b9e1020747db68cc705b2dc47
+    steps:
+      - name: Check out the exact PR commit
+        run: |
+          git init src
+          git -C src fetch --depth=1 "https://github.com/$GITHUB_REPOSITORY.git" "$TARGET_SHA"
+          git -C src checkout --detach FETCH_HEAD
+          test "$(git -C src rev-parse HEAD)" = "$TARGET_SHA"
+      - name: Build Muse2API image
+        run: docker build --build-arg BUILD_SHA="$TARGET_SHA" -t muse2api-upload-ci ./src
+      - name: Run offline Chromium and media regressions
+        run: |
+          docker run --rm --network none --read-only \
+            --tmpfs /tmp:rw,size=256m --tmpfs /root:rw,size=128m \
+            --volume "$PWD/src:/src:ro" --env PYTHONDONTWRITEBYTECODE=1 \
+            --entrypoint sh muse2api-upload-ci -eu -c '
+              cd /src
+              python tests/test_reference_upload_browser.py --root /src
+              python tests/test_composer_send_browser.py --root /src
+              python tests/test_video_late_attachment.py
+              python tests/test_reference_media.py
+            '
